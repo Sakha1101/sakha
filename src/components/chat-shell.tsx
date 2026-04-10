@@ -1,5 +1,6 @@
 "use client";
 
+import Image from "next/image";
 import Papa from "papaparse";
 import * as XLSX from "xlsx";
 import {
@@ -26,6 +27,7 @@ type Props = {
 type TabId = "chat" | "data" | "code";
 type CodeLanguage = "javascript" | "python" | "sql" | "dax";
 type ChartKind = "bar" | "line";
+type RuntimeMode = "browser" | "laptop";
 
 type InstallPromptEvent = Event & {
   prompt: () => Promise<void>;
@@ -95,6 +97,7 @@ export function ChatShell({ initialState }: Props) {
   const [sqlOutput, setSqlOutput] = useState("");
   const [sqlPreview, setSqlPreview] = useState<Record<string, unknown>[]>([]);
   const [codeLanguage, setCodeLanguage] = useState<CodeLanguage>("python");
+  const [runtimeMode, setRuntimeMode] = useState<RuntimeMode>("browser");
   const [code, setCode] = useState(pyStarter);
   const [codeOutput, setCodeOutput] = useState("");
   const [codeAdvice, setCodeAdvice] = useState("");
@@ -125,6 +128,23 @@ export function ChatShell({ initialState }: Props) {
   const numericHeaders = previewHeaders.filter((header) => previewRows.some((row) => Number.isFinite(Number(row[header]))));
   const dimensionHeaders = previewHeaders.filter((header) => !numericHeaders.includes(header));
   const recentTasks = state.tasks.slice(0, 5);
+  const datasetProfile = useMemo(() => {
+    if (!selectedDataset) return null;
+
+    const sample = selectedDataset.rows.slice(0, 100);
+
+    return {
+      rows: selectedDataset.rows.length,
+      columns: selectedDataset.headers.length,
+      numericColumns: selectedDataset.headers.filter((header) =>
+        selectedDataset.rows.some((row) => Number.isFinite(Number(row[header]))),
+      ),
+      missingByColumn: selectedDataset.headers.map((header) => ({
+        header,
+        missing: sample.filter((row) => row[header] === "" || row[header] === null || row[header] === undefined).length,
+      })),
+    };
+  }, [selectedDataset]);
 
   useEffect(() => {
     if (window.alasql) {
@@ -255,7 +275,7 @@ export function ChatShell({ initialState }: Props) {
     try {
       if (codeLanguage === "sql") {
         runSql(code);
-        setCodeAdvice(explainNextSteps("sql", code, sqlOutput || ""));
+        setCodeAdvice(explainNextSteps("sql", code, sqlOutput || "", selectedDataset));
         return;
       }
 
@@ -263,14 +283,49 @@ export function ChatShell({ initialState }: Props) {
         const dax = evaluateDaxFormula(code, selectedDataset);
         setDaxValue(dax.value);
         setCodeOutput(`${dax.value}\n\n${dax.explanation}`);
-        setCodeAdvice(explainNextSteps("dax", code, dax.explanation));
+        setCodeAdvice(explainNextSteps("dax", code, dax.explanation, selectedDataset));
+        return;
+      }
+
+      if (runtimeMode === "laptop") {
+        const response = await fetch("/api/code", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            code,
+            language: codeLanguage === "python" ? "python" : "javascript",
+          }),
+        });
+
+        const data = (await response.json()) as {
+          output?: string;
+          error?: string;
+        };
+
+        if (!response.ok) {
+          throw new Error(data.error || "Laptop execution failed.");
+        }
+
+        const output = data.output || "Execution finished with no stdout.";
+        setCodeOutput(output);
+        setCodeAdvice(
+          [
+            "Ran with the laptop runtime.",
+            explainNextSteps(codeLanguage, code, output, selectedDataset),
+            codeLanguage === "python"
+              ? "Switch to Browser runtime when you want inline plots rendered inside Sakha."
+              : "",
+          ]
+            .filter(Boolean)
+            .join("\n"),
+        );
         return;
       }
 
       if (codeLanguage === "javascript") {
         const result = runJavaScriptLocally(code, selectedDataset?.rows ?? []);
         setCodeOutput(result.output);
-        setCodeAdvice(explainNextSteps("javascript", code, result.output));
+        setCodeAdvice(explainNextSteps("javascript", code, result.output, selectedDataset));
         return;
       }
 
@@ -302,7 +357,7 @@ export function ChatShell({ initialState }: Props) {
       const plotValue = pyodide.globals.get("_sakha_plot");
       const output = buffer.join("\n").trim() || "Python finished with no stdout.";
       setCodeOutput(output);
-      setCodeAdvice(explainNextSteps("python", code, output));
+      setCodeAdvice(explainNextSteps("python", code, output, selectedDataset));
       if (plotValue && String(plotValue) !== "None") {
         setPythonPlot(`data:image/png;base64,${String(plotValue)}`);
       }
@@ -439,9 +494,9 @@ export function ChatShell({ initialState }: Props) {
           </div>
 
           <div className="mt-4 rounded-[16px] bg-black/25 p-3 text-xs text-slate-400">
-            <p>SQL works fully in browser.</p>
-            <p className="mt-2">Python loads in browser with pandas, numpy, and matplotlib.</p>
-            <p className="mt-2">DAX supports practice and evaluation for common measure patterns.</p>
+            <p>Offline after load: SQL, DAX, JavaScript, charts, and file review.</p>
+            <p className="mt-2">Python runs in-browser with pandas, numpy, and matplotlib after the runtime loads once.</p>
+            <p className="mt-2">Laptop runtime is available when Sakha is running on your own machine.</p>
           </div>
 
           <div className="mt-4 min-h-0 flex-1 overflow-auto rounded-[16px] bg-black/20 p-3">
@@ -526,7 +581,7 @@ export function ChatShell({ initialState }: Props) {
                           </div>
                           <button onClick={() => removeAttachment(item.id)} className="text-xs text-slate-400 hover:text-white">Remove</button>
                         </div>
-                        {item.previewUrl ? <img src={item.previewUrl} alt={item.name} className="mt-3 h-28 w-full rounded-[12px] object-cover" /> : null}
+                        {item.previewUrl ? <Image src={item.previewUrl} alt={item.name} width={480} height={240} className="mt-3 h-28 w-full rounded-[12px] object-cover" unoptimized /> : null}
                         {item.table ? <p className="mt-2 text-xs text-slate-400">{item.table.rows.length} rows · {item.table.headers.length} columns</p> : null}
                         {item.textSample ? <p className="mt-2 line-clamp-3 text-xs leading-5 text-slate-400">{item.textSample}</p> : null}
                       </div>
@@ -554,6 +609,44 @@ export function ChatShell({ initialState }: Props) {
                       </button>
                     )) : <div className="rounded-[12px] border border-dashed border-white/10 p-4 text-sm text-slate-400">Upload CSV or Excel to start.</div>}
                   </div>
+                </div>
+                <div className="mt-3 rounded-[18px] bg-black/20 p-4">
+                  <p className="text-xs uppercase tracking-[0.2em] text-slate-500">Data profile</p>
+                  {datasetProfile ? (
+                    <div className="mt-3 space-y-3 text-sm text-slate-300">
+                      <div className="grid grid-cols-2 gap-2">
+                        <div className="rounded-[12px] bg-white/4 p-3">
+                          <div className="text-xs text-slate-500">Rows</div>
+                          <div className="mt-1 text-lg text-white">{datasetProfile.rows}</div>
+                        </div>
+                        <div className="rounded-[12px] bg-white/4 p-3">
+                          <div className="text-xs text-slate-500">Columns</div>
+                          <div className="mt-1 text-lg text-white">{datasetProfile.columns}</div>
+                        </div>
+                      </div>
+                      <div>
+                        <div className="text-xs text-slate-500">Numeric columns</div>
+                        <div className="mt-2 flex flex-wrap gap-2">
+                          {datasetProfile.numericColumns.length ? datasetProfile.numericColumns.slice(0, 8).map((column) => (
+                            <span key={column} className="rounded-full bg-white/6 px-3 py-1 text-xs text-slate-200">{column}</span>
+                          )) : <span className="text-xs text-slate-500">No numeric columns found yet.</span>}
+                        </div>
+                      </div>
+                      <div>
+                        <div className="text-xs text-slate-500">Missing values in first 100 rows</div>
+                        <div className="mt-2 space-y-1">
+                          {datasetProfile.missingByColumn.slice(0, 5).map((item) => (
+                            <div key={item.header} className="flex items-center justify-between rounded-[10px] bg-white/4 px-3 py-2 text-xs text-slate-300">
+                              <span className="truncate">{item.header}</span>
+                              <span>{item.missing}</span>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="mt-3 text-sm text-slate-400">Upload CSV or Excel to see shape, numeric fields, and quick quality hints.</div>
+                  )}
                 </div>
               </div>
               <div className="grid min-h-0 lg:grid-rows-[auto_minmax(0,1fr)]">
@@ -641,6 +734,22 @@ export function ChatShell({ initialState }: Props) {
                     </button>
                   ))}
                 </div>
+                <div className="mb-3 flex flex-wrap items-center gap-2">
+                  {(["browser", "laptop"] as RuntimeMode[]).map((mode) => (
+                    <button
+                      key={mode}
+                      onClick={() => setRuntimeMode(mode)}
+                      className={`rounded-full px-4 py-2 text-sm ${runtimeMode === mode ? "bg-cyan-300 text-slate-950" : "bg-white/6 text-slate-100 hover:bg-white/10"}`}
+                    >
+                      {mode === "browser" ? "Browser runtime" : "Laptop runtime"}
+                    </button>
+                  ))}
+                  <span className="text-xs text-slate-500">
+                    {runtimeMode === "browser"
+                      ? "Use this for offline SQL, DAX, charts, and in-app Python visuals."
+                      : "Use this when Sakha runs on your own laptop and you want local execution."}
+                  </span>
+                </div>
                 <textarea
                   value={code}
                   onChange={(event) => setCode(event.target.value)}
@@ -659,7 +768,7 @@ export function ChatShell({ initialState }: Props) {
                       {codeLanguage === "python" ? <p className="text-xs text-slate-500">{pythonReady ? "pandas + numpy + matplotlib loaded" : "loads on first run"}</p> : null}
                     </div>
                     <pre className="mt-3 min-h-[260px] whitespace-pre-wrap font-mono text-sm leading-7 text-slate-100">{codeOutput || "Run code to see output here."}</pre>
-                    {pythonPlot ? <img src={pythonPlot} alt="Python plot" className="mt-4 max-h-[260px] w-full rounded-[14px] object-contain bg-white" /> : null}
+                    {pythonPlot ? <Image src={pythonPlot} alt="Python plot" width={900} height={520} className="mt-4 max-h-[260px] w-full rounded-[14px] bg-white object-contain" unoptimized /> : null}
                   </div>
                 </div>
                 <div className="border-t border-white/8 p-4">
@@ -733,6 +842,27 @@ async function parseFile(file: File): Promise<AttachmentItem> {
         rows,
       },
     };
+  }
+
+  if (file.name.toLowerCase().endsWith(".json")) {
+    const text = await file.text();
+    try {
+      const parsed = JSON.parse(text) as unknown;
+      if (Array.isArray(parsed) && parsed.every((row) => typeof row === "object" && row !== null && !Array.isArray(row))) {
+        const rows = parsed as Record<string, unknown>[];
+        return {
+          ...base,
+          kind: "table",
+          table: {
+            name: sanitizeName(file.name),
+            headers: rows.length ? Object.keys(rows[0]) : [],
+            rows,
+          },
+        };
+      }
+    } catch {
+      // fall back to text preview below
+    }
   }
 
   if (file.type.startsWith("text/") || /\.(json|sql|md|py|js|ts|csv)$/i.test(file.name)) {
@@ -836,7 +966,7 @@ function explainError(language: CodeLanguage, message: string) {
   return "Read the error top to bottom, isolate the failing line, and rerun after the smallest possible fix.";
 }
 
-function explainNextSteps(language: CodeLanguage, code: string, output: string) {
+function explainNextSteps(language: CodeLanguage, code: string, output: string, dataset?: DataTable) {
   const suggestions: string[] = [];
   if (language === "python") {
     suggestions.push("Use df.head(), df.info(), and df.describe() early to understand the dataset.");
@@ -856,10 +986,33 @@ function explainNextSteps(language: CodeLanguage, code: string, output: string) 
   if (language === "javascript") {
     suggestions.push("Use array methods like map, filter, reduce, and sort for quick data practice.");
   }
+  if (dataset) {
+    suggestions.push(`Current dataset: ${dataset.name} with ${dataset.rows.length} rows and ${dataset.headers.length} columns.`);
+  }
   if (/error|traceback|failed/i.test(output)) {
     suggestions.push(explainError(language, output));
+  } else if (language === "dax" && /Unsupported/i.test(output)) {
+    suggestions.push('Try patterns like `SUM(current_data[Sales])` or `CALCULATE(SUM(current_data[Sales]), current_data[Region] = "East")`.');
+  } else {
+    suggestions.push(summarizeExecution(language, output));
   }
   return suggestions.join("\n");
+}
+
+function summarizeExecution(language: CodeLanguage, output: string) {
+  if (language === "python") {
+    return "Check whether the output reflects the shape you expected, then move from raw inspection to aggregation or visualization.";
+  }
+  if (language === "sql") {
+    return "If the rows look correct, the next best step is usually grouping, filtering, or adding a derived metric.";
+  }
+  if (language === "dax") {
+    return "Once the measure value looks right, test a variation with another column or filter condition.";
+  }
+  if (language === "javascript") {
+    return "If the result is correct, refactor repeated logic into a reusable function and test another dataset slice.";
+  }
+  return output;
 }
 
 function evaluateDaxFormula(code: string, dataset?: DataTable) {
@@ -877,9 +1030,11 @@ function evaluateDaxFormula(code: string, dataset?: DataTable) {
   const sumMatch = expression.match(/^SUM\(([^[]+)\[([^\]]+)\]\)$/i);
   const avgMatch = expression.match(/^AVERAGE\(([^[]+)\[([^\]]+)\]\)$/i);
   const countRowsMatch = expression.match(/^COUNTROWS\(([^)]+)\)$/i);
+  const countMatch = expression.match(/^COUNT\(([^[]+)\[([^\]]+)\]\)$/i);
   const distinctMatch = expression.match(/^DISTINCTCOUNT\(([^[]+)\[([^\]]+)\]\)$/i);
   const minMatch = expression.match(/^MIN\(([^[]+)\[([^\]]+)\]\)$/i);
   const maxMatch = expression.match(/^MAX\(([^[]+)\[([^\]]+)\]\)$/i);
+  const divideMatch = expression.match(/^DIVIDE\(\s*SUM\(([^[]+)\[([^\]]+)\]\)\s*,\s*COUNTROWS\(([^)]+)\)\s*\)$/i);
   const calculateMatch = expression.match(
     /^CALCULATE\(SUM\(([^[]+)\[([^\]]+)\]\),\s*([^[]+)\[([^\]]+)\]\s*=\s*"([^"]+)"\s*\)$/i,
   );
@@ -896,6 +1051,10 @@ function evaluateDaxFormula(code: string, dataset?: DataTable) {
   if (countRowsMatch) {
     return { value: String(rows.length), explanation: `COUNTROWS on current dataset returned ${rows.length}.` };
   }
+  if (countMatch) {
+    const count = rows.filter((row) => row[countMatch[2]] !== "" && row[countMatch[2]] !== null && row[countMatch[2]] !== undefined).length;
+    return { value: String(count), explanation: `COUNT over column ${countMatch[2]} returned ${count}.` };
+  }
   if (distinctMatch) {
     const distinct = new Set(rows.map((row) => String(row[distinctMatch[2]] ?? ""))).size;
     return { value: String(distinct), explanation: `DISTINCTCOUNT over column ${distinctMatch[2]}.` };
@@ -907,6 +1066,15 @@ function evaluateDaxFormula(code: string, dataset?: DataTable) {
   if (maxMatch) {
     const values = numberColumn(rows, maxMatch[2]);
     return { value: String(Math.max(...values)), explanation: `MAX over column ${maxMatch[2]}.` };
+  }
+  if (divideMatch) {
+    const denominator = rows.length;
+    const numerator = sumColumn(rows, divideMatch[2]);
+    const value = denominator ? numerator / denominator : 0;
+    return {
+      value: String(value),
+      explanation: `DIVIDE of SUM(${divideMatch[2]}) by COUNTROWS(current_data).`,
+    };
   }
   if (calculateMatch) {
     const filtered = rows.filter((row) => String(row[calculateMatch[4]] ?? "") === calculateMatch[5]);
