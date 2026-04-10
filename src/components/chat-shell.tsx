@@ -2,9 +2,22 @@
 
 import Papa from "papaparse";
 import * as XLSX from "xlsx";
+import {
+  BarElement,
+  CategoryScale,
+  Chart as ChartJS,
+  Legend,
+  LineElement,
+  LinearScale,
+  PointElement,
+  Tooltip,
+} from "chart.js";
+import { Bar, Line } from "react-chartjs-2";
 import { useEffect, useMemo, useRef, useState } from "react";
 
 import { AppState } from "@/lib/types";
+
+ChartJS.register(CategoryScale, LinearScale, PointElement, LineElement, BarElement, Tooltip, Legend);
 
 type Props = {
   initialState: AppState;
@@ -12,6 +25,7 @@ type Props = {
 
 type TabId = "chat" | "data" | "code";
 type CodeLanguage = "javascript" | "python" | "sql" | "dax";
+type ChartKind = "bar" | "line";
 
 type InstallPromptEvent = Event & {
   prompt: () => Promise<void>;
@@ -34,63 +48,96 @@ type AttachmentItem = {
   table?: DataTable;
 };
 
+type PyodideLike = {
+  loadPackage: (packages: string[] | string) => Promise<void>;
+  runPythonAsync: (code: string) => Promise<unknown>;
+  globals: {
+    set: (name: string, value: unknown) => void;
+    get: (name: string) => unknown;
+  };
+  setStdout: (opts: { batched: (msg: string) => void }) => void;
+  setStderr: (opts: { batched: (msg: string) => void }) => void;
+};
+
 declare global {
   interface Window {
     alasql?: {
       tables: Record<string, { data: Record<string, unknown>[] }>;
       (query: string): unknown;
     };
+    loadPyodide?: (opts: { indexURL: string }) => Promise<PyodideLike>;
   }
 }
 
-const starterPrompt = "Help me learn data analysis. I want step-by-step help and practical examples.";
-const jsStarter = 'console.log("Hello from Sakha");';
-const pyStarter = 'print("Hello from Sakha")';
+const starterPrompt = "Teach me data analysis step by step and help me practice with uploaded files.";
+const jsStarter = `const sales = [120, 180, 90];
+console.log("Average sale:", sales.reduce((a, b) => a + b, 0) / sales.length);`;
+const pyStarter = `import pandas as pd
+import numpy as np
+
+df = pd.DataFrame(rows)
+print(df.head())`;
 const sqlStarter = "SELECT * FROM current_data LIMIT 10;";
-const daxStarter = "Total Sales = SUM(Sales[Amount])";
+const daxStarter = "Total Sales = SUM(current_data[Sales])";
 
 export function ChatShell({ initialState }: Props) {
   const [state, setState] = useState(initialState);
   const [tab, setTab] = useState<TabId>("chat");
   const [prompt, setPrompt] = useState(starterPrompt);
   const [answer, setAnswer] = useState("");
-  const [resolvedProvider, setResolvedProvider] = useState("Ready");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [installPrompt, setInstallPrompt] = useState<InstallPromptEvent | null>(null);
-  const [sqlReady, setSqlReady] = useState(false);
+  const [pythonReady, setPythonReady] = useState(false);
   const [attachments, setAttachments] = useState<AttachmentItem[]>([]);
   const [activeDataset, setActiveDataset] = useState<string>("");
   const [sqlQuery, setSqlQuery] = useState(sqlStarter);
-  const [sqlOutput, setSqlOutput] = useState<string>("");
+  const [sqlOutput, setSqlOutput] = useState("");
   const [sqlPreview, setSqlPreview] = useState<Record<string, unknown>[]>([]);
-  const [codeLanguage, setCodeLanguage] = useState<CodeLanguage>("javascript");
-  const [code, setCode] = useState(jsStarter);
+  const [codeLanguage, setCodeLanguage] = useState<CodeLanguage>("python");
+  const [code, setCode] = useState(pyStarter);
   const [codeOutput, setCodeOutput] = useState("");
+  const [codeAdvice, setCodeAdvice] = useState("");
   const [codeLoading, setCodeLoading] = useState(false);
+  const [chartKind, setChartKind] = useState<ChartKind>("bar");
+  const [chartX, setChartX] = useState("");
+  const [chartY, setChartY] = useState("");
+  const [pythonPlot, setPythonPlot] = useState<string | null>(null);
+  const [daxValue, setDaxValue] = useState("");
   const uploadRef = useRef<HTMLInputElement | null>(null);
   const cameraRef = useRef<HTMLInputElement | null>(null);
+  const pyodideRef = useRef<PyodideLike | null>(null);
 
   const datasets = useMemo(
     () => attachments.filter((item) => item.kind === "table" && item.table).map((item) => item.table as DataTable),
     [attachments],
   );
 
+  const selectedDataset = datasets.find((item) => item.name === activeDataset) ?? datasets[0];
+  const previewRows = useMemo(
+    () => (sqlPreview.length ? sqlPreview : selectedDataset?.rows ?? []),
+    [selectedDataset, sqlPreview],
+  );
+  const previewHeaders = useMemo(
+    () => (previewRows.length ? Object.keys(previewRows[0]) : selectedDataset?.headers ?? []),
+    [previewRows, selectedDataset],
+  );
+  const numericHeaders = previewHeaders.filter((header) => previewRows.some((row) => Number.isFinite(Number(row[header]))));
+  const dimensionHeaders = previewHeaders.filter((header) => !numericHeaders.includes(header));
+  const recentTasks = state.tasks.slice(0, 5);
+
   useEffect(() => {
     if (window.alasql) {
-      setSqlReady(true);
       return;
     }
 
     const script = document.createElement("script");
     script.src = "/vendor/alasql.min.js";
     script.async = true;
-    script.onload = () => setSqlReady(true);
+    script.onload = () => undefined;
     document.body.appendChild(script);
 
-    return () => {
-      script.remove();
-    };
+    return () => script.remove();
   }, []);
 
   useEffect(() => {
@@ -110,9 +157,7 @@ export function ChatShell({ initialState }: Props) {
   }, [activeDataset, datasets]);
 
   useEffect(() => {
-    if (!window.alasql) {
-      return;
-    }
+    if (!window.alasql) return;
 
     for (const dataset of datasets) {
       const safeName = sanitizeName(dataset.name);
@@ -129,11 +174,44 @@ export function ChatShell({ initialState }: Props) {
   }, [datasets, activeDataset]);
 
   useEffect(() => {
-    if (codeLanguage === "javascript" && !code.trim()) setCode(jsStarter);
-    if (codeLanguage === "python" && !code.trim()) setCode(pyStarter);
-    if (codeLanguage === "sql" && !code.trim()) setCode(sqlStarter);
-    if (codeLanguage === "dax" && !code.trim()) setCode(daxStarter);
-  }, [codeLanguage, code]);
+    if (!chartX && (dimensionHeaders[0] || previewHeaders[0])) {
+      setChartX(dimensionHeaders[0] || previewHeaders[0]);
+    }
+    if (!chartY && numericHeaders[0]) {
+      setChartY(numericHeaders[0]);
+    }
+  }, [chartX, chartY, dimensionHeaders, numericHeaders, previewHeaders]);
+
+  async function ensurePythonReady() {
+    if (pyodideRef.current) {
+      setPythonReady(true);
+      return pyodideRef.current;
+    }
+
+    if (!window.loadPyodide) {
+      await new Promise<void>((resolve, reject) => {
+        const script = document.createElement("script");
+        script.src = "https://cdn.jsdelivr.net/pyodide/v0.27.7/full/pyodide.js";
+        script.async = true;
+        script.onload = () => resolve();
+        script.onerror = () => reject(new Error("Python runtime failed to load."));
+        document.body.appendChild(script);
+      });
+    }
+
+    if (!window.loadPyodide) {
+      throw new Error("Python runtime is unavailable.");
+    }
+
+    const pyodide = await window.loadPyodide({
+      indexURL: "https://cdn.jsdelivr.net/pyodide/v0.27.7/full/",
+    });
+
+    await pyodide.loadPackage(["numpy", "pandas", "matplotlib"]);
+    pyodideRef.current = pyodide;
+    setPythonReady(true);
+    return pyodide;
+  }
 
   async function runPrompt() {
     if (!prompt.trim()) return;
@@ -152,7 +230,6 @@ export function ChatShell({ initialState }: Props) {
       const data = (await response.json()) as {
         message?: string;
         error?: string;
-        resolvedProvider?: string;
         state?: AppState;
       };
 
@@ -161,7 +238,6 @@ export function ChatShell({ initialState }: Props) {
       }
 
       setAnswer(data.message || "");
-      setResolvedProvider(data.resolvedProvider || "Ready");
       if (data.state) setState(data.state);
     } catch (caughtError) {
       setError(caughtError instanceof Error ? caughtError.message : "Unknown error");
@@ -171,40 +247,69 @@ export function ChatShell({ initialState }: Props) {
   }
 
   async function runCode() {
-    if (codeLanguage === "sql") {
-      runSql(code);
-      return;
-    }
-
-    if (codeLanguage === "dax") {
-      setCodeOutput([
-        "DAX practice mode",
-        "",
-        "Your formula is saved in the editor.",
-        "To evaluate DAX fully, Sakha needs a Power BI model context.",
-        "Use chat to ask Sakha to review, simplify, or explain this DAX formula.",
-      ].join("\n"));
-      return;
-    }
-
     setCodeLoading(true);
     setCodeOutput("");
+    setCodeAdvice("");
+    setPythonPlot(null);
 
     try {
-      const response = await fetch("/api/code", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ code, language: codeLanguage }),
-      });
-
-      const data = (await response.json()) as { output?: string; error?: string };
-      if (!response.ok) {
-        throw new Error(data.error || "Code execution failed.");
+      if (codeLanguage === "sql") {
+        runSql(code);
+        setCodeAdvice(explainNextSteps("sql", code, sqlOutput || ""));
+        return;
       }
 
-      setCodeOutput(data.output || "Finished with no output.");
+      if (codeLanguage === "dax") {
+        const dax = evaluateDaxFormula(code, selectedDataset);
+        setDaxValue(dax.value);
+        setCodeOutput(`${dax.value}\n\n${dax.explanation}`);
+        setCodeAdvice(explainNextSteps("dax", code, dax.explanation));
+        return;
+      }
+
+      if (codeLanguage === "javascript") {
+        const result = runJavaScriptLocally(code, selectedDataset?.rows ?? []);
+        setCodeOutput(result.output);
+        setCodeAdvice(explainNextSteps("javascript", code, result.output));
+        return;
+      }
+
+      const pyodide = await ensurePythonReady();
+      const buffer: string[] = [];
+      pyodide.setStdout({ batched: (msg) => buffer.push(msg) });
+      pyodide.setStderr({ batched: (msg) => buffer.push(msg) });
+      pyodide.globals.set("rows_json", JSON.stringify(selectedDataset?.rows ?? []));
+
+      await pyodide.runPythonAsync([
+        "import json",
+        "import io",
+        "import base64",
+        "import pandas as pd",
+        "import numpy as np",
+        "import matplotlib.pyplot as plt",
+        "rows = json.loads(rows_json)",
+        "df = pd.DataFrame(rows)",
+        "plt.close('all')",
+        code,
+        "_sakha_plot = None",
+        "if plt.get_fignums():",
+        "    buf = io.BytesIO()",
+        "    plt.tight_layout()",
+        "    plt.savefig(buf, format='png')",
+        "    _sakha_plot = base64.b64encode(buf.getvalue()).decode('utf-8')",
+      ].join("\n"));
+
+      const plotValue = pyodide.globals.get("_sakha_plot");
+      const output = buffer.join("\n").trim() || "Python finished with no stdout.";
+      setCodeOutput(output);
+      setCodeAdvice(explainNextSteps("python", code, output));
+      if (plotValue && String(plotValue) !== "None") {
+        setPythonPlot(`data:image/png;base64,${String(plotValue)}`);
+      }
     } catch (caughtError) {
-      setCodeOutput(caughtError instanceof Error ? caughtError.message : "Unknown error");
+      const message = caughtError instanceof Error ? caughtError.message : "Execution failed.";
+      setCodeOutput(message);
+      setCodeAdvice(explainError(codeLanguage, message));
     } finally {
       setCodeLoading(false);
     }
@@ -212,8 +317,10 @@ export function ChatShell({ initialState }: Props) {
 
   function runSql(query: string) {
     if (!window.alasql) {
-      setSqlOutput("SQL engine is still loading. Try again in a moment.");
+      const message = "SQL engine is still loading. Try again in a moment.";
+      setSqlOutput(message);
       setSqlPreview([]);
+      setCodeOutput(message);
       setTab("data");
       return;
     }
@@ -221,16 +328,21 @@ export function ChatShell({ initialState }: Props) {
     try {
       const result = window.alasql(query) as Record<string, unknown>[] | number | string;
       if (Array.isArray(result)) {
-        setSqlPreview(result.slice(0, 20));
+        setSqlPreview(result.slice(0, 50));
         setSqlOutput(`Returned ${result.length} row(s).`);
+        setCodeOutput(`Returned ${result.length} row(s).`);
       } else {
         setSqlPreview([]);
         setSqlOutput(String(result));
+        setCodeOutput(String(result));
       }
       setTab("data");
     } catch (caughtError) {
+      const message = caughtError instanceof Error ? caughtError.message : "SQL failed.";
       setSqlPreview([]);
-      setSqlOutput(caughtError instanceof Error ? caughtError.message : "SQL failed.");
+      setSqlOutput(message);
+      setCodeOutput(message);
+      setCodeAdvice(explainError("sql", message));
       setTab("data");
     }
   }
@@ -247,7 +359,6 @@ export function ChatShell({ initialState }: Props) {
 
   async function handleFiles(files: FileList | null) {
     if (!files?.length) return;
-
     const nextItems = await Promise.all(Array.from(files).map(parseFile));
     const merged = [...attachments, ...nextItems];
     setAttachments(merged);
@@ -273,13 +384,11 @@ export function ChatShell({ initialState }: Props) {
   }
 
   function downloadCsv() {
-    if (!sqlPreview.length) return;
-    const csv = Papa.unparse(sqlPreview);
-    downloadText("sakha-sql-result.csv", csv);
+    if (!previewRows.length) return;
+    downloadText("sakha-result.csv", Papa.unparse(previewRows));
   }
 
-  const selectedDataset = datasets.find((item) => item.name === activeDataset) ?? datasets[0];
-  const recentTasks = state.tasks.slice(0, 5);
+  const chartData = buildChartData(previewRows, chartX, chartY);
 
   return (
     <main className="min-h-screen bg-transparent px-3 py-3 text-white md:px-4 md:py-4">
@@ -304,14 +413,14 @@ export function ChatShell({ initialState }: Props) {
         <aside className="glass flex flex-col rounded-[22px] p-3">
           <div className="rounded-[16px] bg-white/4 p-3">
             <p className="text-[11px] uppercase tracking-[0.28em] text-slate-400">Sakha</p>
-            <p className="mt-2 text-sm text-slate-200">All-in-one workspace</p>
+            <p className="mt-2 text-sm text-slate-200">Data analysis workspace</p>
           </div>
 
           <div className="mt-3 grid gap-2">
             {[
               ["chat", "Chat"],
               ["data", "Data Lab"],
-              ["code", "Code"],
+              ["code", "Code Lab"],
             ].map(([value, label]) => (
               <button
                 key={value}
@@ -324,30 +433,15 @@ export function ChatShell({ initialState }: Props) {
           </div>
 
           <div className="mt-4 grid gap-2">
-            <button
-              onClick={() => uploadRef.current?.click()}
-              className="rounded-[14px] bg-white/4 px-3 py-3 text-left text-sm text-slate-100 hover:bg-white/8"
-            >
-              Attach files
-            </button>
-            <button
-              onClick={() => cameraRef.current?.click()}
-              className="rounded-[14px] bg-white/4 px-3 py-3 text-left text-sm text-slate-100 hover:bg-white/8"
-            >
-              Camera upload
-            </button>
-            <button
-              onClick={installApp}
-              className="rounded-[14px] bg-white/4 px-3 py-3 text-left text-sm text-slate-100 hover:bg-white/8"
-            >
-              Install app
-            </button>
+            <button onClick={() => uploadRef.current?.click()} className="rounded-[14px] bg-white/4 px-3 py-3 text-left text-sm text-slate-100 hover:bg-white/8">Attach files</button>
+            <button onClick={() => cameraRef.current?.click()} className="rounded-[14px] bg-white/4 px-3 py-3 text-left text-sm text-slate-100 hover:bg-white/8">Camera upload</button>
+            <button onClick={installApp} className="rounded-[14px] bg-white/4 px-3 py-3 text-left text-sm text-slate-100 hover:bg-white/8">Install app</button>
           </div>
 
-          <div className="mt-4 rounded-[16px] bg-black/25 p-3">
-            <p className="text-xs uppercase tracking-[0.2em] text-slate-500">Storage</p>
-            <p className="mt-2 text-sm text-white">{state.storageMode === "google-drive" ? "Google Drive" : "Local"}</p>
-            <p className="mt-2 text-xs text-slate-400">Google login and Drive sync need backend OAuth setup, which we can wire next.</p>
+          <div className="mt-4 rounded-[16px] bg-black/25 p-3 text-xs text-slate-400">
+            <p>SQL works fully in browser.</p>
+            <p className="mt-2">Python loads in browser with pandas, numpy, and matplotlib.</p>
+            <p className="mt-2">DAX supports practice and evaluation for common measure patterns.</p>
           </div>
 
           <div className="mt-4 min-h-0 flex-1 overflow-auto rounded-[16px] bg-black/20 p-3">
@@ -363,28 +457,27 @@ export function ChatShell({ initialState }: Props) {
                   className="w-full rounded-[12px] bg-white/4 px-3 py-3 text-left text-sm text-slate-100 hover:bg-white/8"
                 >
                   <div className="truncate font-medium text-white">{task.title}</div>
-                  <div className="mt-1 text-slate-400">{task.provider}</div>
+                  <div className="mt-1 truncate text-slate-400">{task.instruction}</div>
                 </button>
               ))}
             </div>
           </div>
         </aside>
 
-        <section className="glass-strong flex min-h-[76vh] flex-col rounded-[22px] overflow-hidden">
+        <section className="glass-strong flex min-h-[76vh] flex-col overflow-hidden rounded-[22px]">
           <header className="flex flex-wrap items-center justify-between gap-3 border-b border-white/8 px-4 py-3">
             <div>
-              <h1 className="text-lg font-medium text-white">{tab === "chat" ? "Sakha" : tab === "data" ? "Data Lab" : "Code Studio"}</h1>
+              <h1 className="text-lg font-medium text-white">{tab === "chat" ? "Sakha" : tab === "data" ? "Data Lab" : "Code Lab"}</h1>
               <p className="text-sm text-slate-400">
                 {tab === "chat"
-                  ? "Ask, attach, learn, practice, and generate from one workspace."
+                  ? "Learn, ask, upload, and get guided next steps."
                   : tab === "data"
-                    ? "Work with uploaded CSV/XLSX files, run SQL, preview rows, and export results."
-                    : "Run JavaScript or Python on your laptop, practice SQL, and draft DAX formulas."}
+                    ? "Upload CSV or Excel, run SQL, preview data, and build quick charts."
+                    : "Practice Python, SQL, JavaScript, and DAX with output, advice, and visuals."}
               </p>
             </div>
-            <div className="flex items-center gap-2 rounded-full bg-white/5 px-3 py-2 text-sm text-slate-300">
-              <span className="h-2 w-2 rounded-full bg-lime-300" />
-              {resolvedProvider}
+            <div className="rounded-full bg-white/5 px-3 py-2 text-sm text-slate-300">
+              {pythonReady ? "Python ready" : codeLanguage === "python" ? "Python loads on demand" : "Browser practice mode"}
             </div>
           </header>
 
@@ -393,22 +486,14 @@ export function ChatShell({ initialState }: Props) {
               <div className="flex min-h-0 flex-col">
                 <div className="flex-1 overflow-auto px-4 py-4">
                   {answer ? (
-                    <div className="rounded-[18px] bg-black/25 p-5 text-sm leading-7 whitespace-pre-wrap text-slate-100">
-                      {answer}
-                    </div>
+                    <div className="rounded-[18px] bg-black/25 p-5 whitespace-pre-wrap text-sm leading-7 text-slate-100">{answer}</div>
                   ) : (
                     <div className="rounded-[18px] border border-dashed border-white/10 bg-black/20 p-5 text-sm leading-7 text-slate-400">
-                      Start with a question, upload files, or ask Sakha to teach you data analysis, review code, outline a PPT, explain SQL, or plan a dashboard.
+                      Ask Sakha to explain code, review SQL, teach pandas, design dashboards, prepare PPT outlines, or analyze attached files.
                     </div>
                   )}
-
-                  {error ? (
-                    <div className="mt-3 rounded-[18px] border border-rose-400/20 bg-rose-400/10 p-4 text-sm text-rose-200">
-                      {error}
-                    </div>
-                  ) : null}
+                  {error ? <div className="mt-3 rounded-[18px] border border-rose-400/20 bg-rose-400/10 p-4 text-sm text-rose-200">{error}</div> : null}
                 </div>
-
                 <div className="border-t border-white/8 px-4 py-4">
                   <div className="rounded-[20px] bg-black/25 p-3">
                     <textarea
@@ -419,54 +504,33 @@ export function ChatShell({ initialState }: Props) {
                     />
                     <div className="mt-3 flex flex-wrap items-center justify-between gap-3">
                       <div className="flex flex-wrap gap-2">
-                        <button onClick={() => uploadRef.current?.click()} className="rounded-full bg-white/6 px-3 py-2 text-sm text-slate-200 hover:bg-white/10">
-                          Attach
-                        </button>
-                        <button onClick={() => cameraRef.current?.click()} className="rounded-full bg-white/6 px-3 py-2 text-sm text-slate-200 hover:bg-white/10">
-                          Camera
-                        </button>
-                        {answer ? (
-                          <button onClick={() => downloadText("sakha-response.txt", answer)} className="rounded-full bg-white/6 px-3 py-2 text-sm text-slate-200 hover:bg-white/10">
-                            Download
-                          </button>
-                        ) : null}
+                        <button onClick={() => uploadRef.current?.click()} className="rounded-full bg-white/6 px-3 py-2 text-sm text-slate-200 hover:bg-white/10">Attach</button>
+                        <button onClick={() => cameraRef.current?.click()} className="rounded-full bg-white/6 px-3 py-2 text-sm text-slate-200 hover:bg-white/10">Camera</button>
+                        {answer ? <button onClick={() => downloadText("sakha-response.txt", answer)} className="rounded-full bg-white/6 px-3 py-2 text-sm text-slate-200 hover:bg-white/10">Download</button> : null}
                       </div>
-                      <button
-                        onClick={runPrompt}
-                        disabled={loading}
-                        className="rounded-full bg-lime-300 px-5 py-2.5 text-sm font-medium text-slate-950 transition hover:bg-lime-200 disabled:opacity-70"
-                      >
-                        {loading ? "Running..." : "Send"}
-                      </button>
+                      <button onClick={runPrompt} disabled={loading} className="rounded-full bg-lime-300 px-5 py-2.5 text-sm font-medium text-slate-950 hover:bg-lime-200 disabled:opacity-70">{loading ? "Running..." : "Send"}</button>
                     </div>
                   </div>
                 </div>
               </div>
-
-              <div className="border-t border-white/8 lg:border-l lg:border-t-0 lg:border-white/8 p-4">
+              <div className="border-t border-white/8 p-4 lg:border-l lg:border-t-0 lg:border-white/8">
                 <div className="rounded-[18px] bg-black/20 p-4">
                   <p className="text-xs uppercase tracking-[0.2em] text-slate-500">Attachments</p>
                   <div className="mt-3 space-y-3">
-                    {attachments.length ? (
-                      attachments.map((item) => (
-                        <div key={item.id} className="rounded-[14px] bg-white/4 p-3">
-                          <div className="flex items-start justify-between gap-3">
-                            <div className="min-w-0">
-                              <div className="truncate text-sm font-medium text-white">{item.name}</div>
-                              <div className="mt-1 text-xs text-slate-400">{item.kind} · {item.sizeLabel}</div>
-                            </div>
-                            <button onClick={() => removeAttachment(item.id)} className="text-xs text-slate-400 hover:text-white">Remove</button>
+                    {attachments.length ? attachments.map((item) => (
+                      <div key={item.id} className="rounded-[14px] bg-white/4 p-3">
+                        <div className="flex items-start justify-between gap-3">
+                          <div className="min-w-0">
+                            <div className="truncate text-sm font-medium text-white">{item.name}</div>
+                            <div className="mt-1 text-xs text-slate-400">{item.kind} · {item.sizeLabel}</div>
                           </div>
-                          {item.previewUrl ? <img src={item.previewUrl} alt={item.name} className="mt-3 h-28 w-full rounded-[12px] object-cover" /> : null}
-                          {item.table ? <p className="mt-2 text-xs text-slate-400">{item.table.rows.length} rows · {item.table.headers.length} columns</p> : null}
-                          {item.textSample ? <p className="mt-2 line-clamp-3 text-xs leading-5 text-slate-400">{item.textSample}</p> : null}
+                          <button onClick={() => removeAttachment(item.id)} className="text-xs text-slate-400 hover:text-white">Remove</button>
                         </div>
-                      ))
-                    ) : (
-                      <div className="rounded-[14px] border border-dashed border-white/10 p-4 text-sm text-slate-400">
-                        Upload CSV, Excel, images, PDF, PPT, text, SQL, JSON, and other files here.
+                        {item.previewUrl ? <img src={item.previewUrl} alt={item.name} className="mt-3 h-28 w-full rounded-[12px] object-cover" /> : null}
+                        {item.table ? <p className="mt-2 text-xs text-slate-400">{item.table.rows.length} rows · {item.table.headers.length} columns</p> : null}
+                        {item.textSample ? <p className="mt-2 line-clamp-3 text-xs leading-5 text-slate-400">{item.textSample}</p> : null}
                       </div>
-                    )}
+                    )) : <div className="rounded-[14px] border border-dashed border-white/10 p-4 text-sm text-slate-400">Upload images, CSV, Excel, PDF, PPT, text, JSON, and SQL files here.</div>}
                   </div>
                 </div>
               </div>
@@ -474,7 +538,7 @@ export function ChatShell({ initialState }: Props) {
           ) : null}
 
           {tab === "data" ? (
-            <div className="grid flex-1 gap-0 lg:grid-cols-[320px_minmax(0,1fr)]">
+            <div className="grid flex-1 gap-0 lg:grid-cols-[300px_minmax(0,1fr)]">
               <div className="border-b border-white/8 p-4 lg:border-b-0 lg:border-r lg:border-white/8">
                 <div className="rounded-[18px] bg-black/20 p-4">
                   <p className="text-xs uppercase tracking-[0.2em] text-slate-500">Datasets</p>
@@ -492,7 +556,6 @@ export function ChatShell({ initialState }: Props) {
                   </div>
                 </div>
               </div>
-
               <div className="grid min-h-0 lg:grid-rows-[auto_minmax(0,1fr)]">
                 <div className="border-b border-white/8 p-4">
                   <div className="grid gap-3 lg:grid-cols-[minmax(0,1fr)_auto]">
@@ -506,10 +569,8 @@ export function ChatShell({ initialState }: Props) {
                       <button onClick={downloadCsv} className="rounded-full bg-white/6 px-5 py-2.5 text-sm text-slate-100 hover:bg-white/10">Download CSV</button>
                     </div>
                   </div>
-                  <p className="mt-2 text-xs text-slate-500">Active table is available as `current_data`. Uploaded datasets are also available by sanitized table name.</p>
-                  {!sqlReady ? <p className="mt-2 text-xs text-slate-500">Loading SQL engine...</p> : null}
+                  <p className="mt-2 text-xs text-slate-500">Use `current_data` for the active dataset. SQL runs fully in-browser and can work offline after the app is loaded.</p>
                 </div>
-
                 <div className="grid min-h-0 gap-0 lg:grid-cols-[1.1fr_0.9fr]">
                   <div className="border-b border-white/8 p-4 lg:border-b-0 lg:border-r lg:border-white/8">
                     <div className="rounded-[18px] bg-black/20 p-4">
@@ -517,51 +578,45 @@ export function ChatShell({ initialState }: Props) {
                         <p className="text-xs uppercase tracking-[0.2em] text-slate-500">Preview</p>
                         <p className="text-xs text-slate-500">{selectedDataset ? selectedDataset.name : "No dataset"}</p>
                       </div>
-                      <div className="mt-3 max-h-[420px] overflow-auto rounded-[14px] border border-white/8">
-                        {selectedDataset ? (
+                      <div className="mt-3 max-h-[280px] overflow-auto rounded-[14px] border border-white/8">
+                        {previewHeaders.length ? (
                           <table className="min-w-full text-left text-sm text-slate-200">
                             <thead className="bg-white/6 text-slate-400">
-                              <tr>
-                                {selectedDataset.headers.slice(0, 8).map((header) => <th key={header} className="px-3 py-2 font-medium">{header}</th>)}
-                              </tr>
+                              <tr>{previewHeaders.slice(0, 8).map((header) => <th key={header} className="px-3 py-2 font-medium">{header}</th>)}</tr>
                             </thead>
                             <tbody>
-                              {selectedDataset.rows.slice(0, 10).map((row, rowIndex) => (
+                              {previewRows.slice(0, 15).map((row, rowIndex) => (
                                 <tr key={rowIndex} className="border-t border-white/6">
-                                  {selectedDataset.headers.slice(0, 8).map((header) => <td key={header} className="px-3 py-2 text-slate-300">{String(row[header] ?? "")}</td>)}
+                                  {previewHeaders.slice(0, 8).map((header) => <td key={header} className="px-3 py-2 text-slate-300">{String(row[header] ?? "")}</td>)}
                                 </tr>
                               ))}
                             </tbody>
                           </table>
-                        ) : (
-                          <div className="p-4 text-sm text-slate-400">Upload data to preview rows here.</div>
-                        )}
+                        ) : <div className="p-4 text-sm text-slate-400">Run SQL or choose a dataset to preview data.</div>}
+                      </div>
+                      <div className="mt-4 grid gap-2 md:grid-cols-3">
+                        <select value={chartKind} onChange={(event) => setChartKind(event.target.value as ChartKind)} className="rounded-[12px] border border-white/8 bg-black/25 px-3 py-2 text-sm text-white outline-none">
+                          <option value="bar">Bar chart</option>
+                          <option value="line">Line chart</option>
+                        </select>
+                        <select value={chartX} onChange={(event) => setChartX(event.target.value)} className="rounded-[12px] border border-white/8 bg-black/25 px-3 py-2 text-sm text-white outline-none">
+                          <option value="">X axis</option>
+                          {previewHeaders.map((header) => <option key={header} value={header}>{header}</option>)}
+                        </select>
+                        <select value={chartY} onChange={(event) => setChartY(event.target.value)} className="rounded-[12px] border border-white/8 bg-black/25 px-3 py-2 text-sm text-white outline-none">
+                          <option value="">Y axis</option>
+                          {numericHeaders.map((header) => <option key={header} value={header}>{header}</option>)}
+                        </select>
                       </div>
                     </div>
                   </div>
-
                   <div className="p-4">
                     <div className="rounded-[18px] bg-black/20 p-4">
-                      <p className="text-xs uppercase tracking-[0.2em] text-slate-500">Query result</p>
-                      <p className="mt-3 text-sm text-slate-300">{sqlOutput || "Run SQL to see the result here."}</p>
-                      {sqlPreview.length ? (
-                        <div className="mt-3 max-h-[320px] overflow-auto rounded-[14px] border border-white/8">
-                          <table className="min-w-full text-left text-sm text-slate-200">
-                            <thead className="bg-white/6 text-slate-400">
-                              <tr>
-                                {Object.keys(sqlPreview[0]).map((header) => <th key={header} className="px-3 py-2 font-medium">{header}</th>)}
-                              </tr>
-                            </thead>
-                            <tbody>
-                              {sqlPreview.map((row, index) => (
-                                <tr key={index} className="border-t border-white/6">
-                                  {Object.keys(sqlPreview[0]).map((header) => <td key={header} className="px-3 py-2 text-slate-300">{String(row[header] ?? "")}</td>)}
-                                </tr>
-                              ))}
-                            </tbody>
-                          </table>
-                        </div>
-                      ) : null}
+                      <p className="text-xs uppercase tracking-[0.2em] text-slate-500">Result and chart</p>
+                      <p className="mt-3 text-sm text-slate-300">{sqlOutput || "Run SQL to see row counts and chartable output here."}</p>
+                      <div className="mt-4 h-[320px] rounded-[14px] border border-white/8 bg-black/25 p-3">
+                        {chartData ? (chartKind === "bar" ? <Bar data={chartData} options={chartOptions} /> : <Line data={chartData} options={chartOptions} />) : <div className="flex h-full items-center justify-center text-sm text-slate-500">Choose chart axes from query output or dataset preview.</div>}
+                      </div>
                     </div>
                   </div>
                 </div>
@@ -570,15 +625,15 @@ export function ChatShell({ initialState }: Props) {
           ) : null}
 
           {tab === "code" ? (
-            <div className="grid flex-1 gap-0 lg:grid-cols-[1.1fr_0.9fr]">
+            <div className="grid flex-1 gap-0 lg:grid-cols-[1.05fr_0.95fr]">
               <div className="border-b border-white/8 p-4 lg:border-b-0 lg:border-r lg:border-white/8">
                 <div className="mb-3 flex flex-wrap items-center gap-2">
-                  {(["javascript", "python", "sql", "dax"] as CodeLanguage[]).map((language) => (
+                  {(["python", "sql", "dax", "javascript"] as CodeLanguage[]).map((language) => (
                     <button
                       key={language}
                       onClick={() => {
                         setCodeLanguage(language);
-                        setCode(language === "javascript" ? jsStarter : language === "python" ? pyStarter : language === "sql" ? sqlStarter : daxStarter);
+                        setCode(language === "python" ? pyStarter : language === "sql" ? sqlStarter : language === "dax" ? daxStarter : jsStarter);
                       }}
                       className={`rounded-full px-4 py-2 text-sm ${codeLanguage === language ? "bg-lime-300 text-slate-950" : "bg-white/6 text-slate-100 hover:bg-white/10"}`}
                     >
@@ -592,18 +647,27 @@ export function ChatShell({ initialState }: Props) {
                   className="min-h-[460px] w-full resize-none rounded-[18px] border border-white/8 bg-black/25 p-4 font-mono text-sm leading-7 text-slate-100 outline-none"
                 />
                 <div className="mt-3 flex flex-wrap items-center gap-2">
-                  <button onClick={runCode} disabled={codeLoading} className="rounded-full bg-lime-300 px-5 py-2.5 text-sm font-medium text-slate-950 hover:bg-lime-200 disabled:opacity-70">
-                    {codeLoading ? "Running..." : codeLanguage === "sql" ? "Run SQL" : "Run code"}
-                  </button>
-                  <button onClick={() => downloadText(codeLanguage === "sql" ? "sakha-query.sql" : `sakha.${codeLanguage === "python" ? "py" : codeLanguage === "dax" ? "dax" : "js"}`, code)} className="rounded-full bg-white/6 px-5 py-2.5 text-sm text-slate-100 hover:bg-white/10">
-                    Download
-                  </button>
+                  <button onClick={runCode} disabled={codeLoading} className="rounded-full bg-lime-300 px-5 py-2.5 text-sm font-medium text-slate-950 hover:bg-lime-200 disabled:opacity-70">{codeLoading ? "Running..." : "Run"}</button>
+                  <button onClick={() => downloadText(codeLanguage === "python" ? "sakha.py" : codeLanguage === "sql" ? "sakha.sql" : codeLanguage === "dax" ? "sakha.dax" : "sakha.js", code)} className="rounded-full bg-white/6 px-5 py-2.5 text-sm text-slate-100 hover:bg-white/10">Download</button>
                 </div>
               </div>
-              <div className="p-4">
-                <div className="rounded-[18px] bg-black/25 p-4">
-                  <p className="text-xs uppercase tracking-[0.2em] text-slate-500">Output</p>
-                  <pre className="mt-3 min-h-[460px] whitespace-pre-wrap font-mono text-sm leading-7 text-slate-100">{codeOutput || "Run code to see the output here."}</pre>
+              <div className="grid min-h-0 gap-0 lg:grid-rows-[minmax(0,1fr)_auto]">
+                <div className="p-4">
+                  <div className="rounded-[18px] bg-black/25 p-4">
+                    <div className="flex items-center justify-between">
+                      <p className="text-xs uppercase tracking-[0.2em] text-slate-500">Output</p>
+                      {codeLanguage === "python" ? <p className="text-xs text-slate-500">{pythonReady ? "pandas + numpy + matplotlib loaded" : "loads on first run"}</p> : null}
+                    </div>
+                    <pre className="mt-3 min-h-[260px] whitespace-pre-wrap font-mono text-sm leading-7 text-slate-100">{codeOutput || "Run code to see output here."}</pre>
+                    {pythonPlot ? <img src={pythonPlot} alt="Python plot" className="mt-4 max-h-[260px] w-full rounded-[14px] object-contain bg-white" /> : null}
+                  </div>
+                </div>
+                <div className="border-t border-white/8 p-4">
+                  <div className="rounded-[18px] bg-black/20 p-4">
+                    <p className="text-xs uppercase tracking-[0.2em] text-slate-500">Coach</p>
+                    <div className="mt-3 whitespace-pre-wrap text-sm leading-7 text-slate-300">{codeAdvice || "Sakha will explain errors, suggest fixes, and guide better patterns after each run."}</div>
+                    {codeLanguage === "dax" && daxValue ? <div className="mt-3 rounded-[14px] bg-white/4 p-3 text-sm text-slate-100">Value: {daxValue}</div> : null}
+                  </div>
                 </div>
               </div>
             </div>
@@ -625,9 +689,8 @@ function formatSize(bytes: number) {
 }
 
 async function parseFile(file: File): Promise<AttachmentItem> {
-  const id = crypto.randomUUID();
   const base = {
-    id,
+    id: crypto.randomUUID(),
     name: file.name,
     type: file.type || "unknown",
     sizeLabel: formatSize(file.size),
@@ -643,18 +706,14 @@ async function parseFile(file: File): Promise<AttachmentItem> {
 
   if (file.name.toLowerCase().endsWith(".csv")) {
     const text = await file.text();
-    const parsed = Papa.parse<Record<string, unknown>>(text, {
-      header: true,
-      skipEmptyLines: true,
-    });
-    const headers = parsed.meta.fields ?? [];
+    const parsed = Papa.parse<Record<string, unknown>>(text, { header: true, skipEmptyLines: true });
     const rows = parsed.data.filter((row) => Object.keys(row).length);
     return {
       ...base,
       kind: "table",
       table: {
         name: sanitizeName(file.name),
-        headers,
+        headers: parsed.meta.fields ?? [],
         rows,
       },
     };
@@ -664,30 +723,24 @@ async function parseFile(file: File): Promise<AttachmentItem> {
     const buffer = await file.arrayBuffer();
     const workbook = XLSX.read(buffer, { type: "array" });
     const firstSheet = workbook.SheetNames[0];
-    const sheet = workbook.Sheets[firstSheet];
-    const rows = XLSX.utils.sheet_to_json<Record<string, unknown>>(sheet, { defval: "" });
-    const headers = rows.length ? Object.keys(rows[0]) : [];
+    const rows = XLSX.utils.sheet_to_json<Record<string, unknown>>(workbook.Sheets[firstSheet], { defval: "" });
     return {
       ...base,
       kind: "table",
       table: {
         name: sanitizeName(file.name),
-        headers,
+        headers: rows.length ? Object.keys(rows[0]) : [],
         rows,
       },
     };
   }
 
-  if (
-    file.type.startsWith("text/") ||
-    file.name.toLowerCase().endsWith(".json") ||
-    file.name.toLowerCase().endsWith(".sql")
-  ) {
+  if (file.type.startsWith("text/") || /\.(json|sql|md|py|js|ts|csv)$/i.test(file.name)) {
     const text = await file.text();
     return {
       ...base,
       kind: "text",
-      textSample: text.slice(0, 300),
+      textSample: text.slice(0, 400),
     };
   }
 
@@ -699,19 +752,184 @@ async function parseFile(file: File): Promise<AttachmentItem> {
 
 function buildAttachmentContext(items: AttachmentItem[]) {
   if (!items.length) return "";
+  return [
+    "Attachment summary:",
+    ...items.map((item) => {
+      if (item.table) {
+        return `- ${item.name}: ${item.table.rows.length} rows, columns: ${item.table.headers.join(", ")}`;
+      }
+      if (item.textSample) {
+        return `- ${item.name}: ${item.textSample.replace(/\s+/g, " ").slice(0, 180)}`;
+      }
+      if (item.kind === "image") {
+        return `- ${item.name}: image attachment`;
+      }
+      return `- ${item.name}: file attachment`;
+    }),
+  ].join("\n");
+}
 
-  const lines = items.map((item) => {
-    if (item.table) {
-      return `Attached dataset ${item.name}: ${item.table.rows.length} rows, columns: ${item.table.headers.join(", ")}`;
-    }
-    if (item.textSample) {
-      return `Attached text file ${item.name}: sample -> ${item.textSample.replace(/\s+/g, " ").slice(0, 160)}`;
-    }
-    if (item.kind === "image") {
-      return `Attached image ${item.name}`;
-    }
-    return `Attached file ${item.name}`;
-  });
+function buildChartData(rows: Record<string, unknown>[], x: string, y: string) {
+  if (!rows.length || !x || !y) return null;
+  return {
+    labels: rows.slice(0, 20).map((row) => String(row[x] ?? "")),
+    datasets: [
+      {
+        label: y,
+        data: rows.slice(0, 20).map((row) => Number(row[y] ?? 0)),
+        backgroundColor: "rgba(214,255,87,0.65)",
+        borderColor: "rgba(107,226,255,1)",
+        borderWidth: 2,
+      },
+    ],
+  };
+}
 
-  return `Attachment summary:\n${lines.join("\n")}`;
+const chartOptions = {
+  responsive: true,
+  maintainAspectRatio: false,
+  plugins: {
+    legend: {
+      labels: {
+        color: "#e6eef8",
+      },
+    },
+  },
+  scales: {
+    x: {
+      ticks: { color: "#94abc2" },
+      grid: { color: "rgba(255,255,255,0.06)" },
+    },
+    y: {
+      ticks: { color: "#94abc2" },
+      grid: { color: "rgba(255,255,255,0.06)" },
+    },
+  },
+};
+
+function runJavaScriptLocally(code: string, rows: Record<string, unknown>[]) {
+  const logs: string[] = [];
+  const consoleProxy = {
+    log: (...args: unknown[]) => logs.push(args.map(String).join(" ")),
+    error: (...args: unknown[]) => logs.push(args.map(String).join(" ")),
+  };
+  const runner = new Function("rows", "console", `${code}`);
+  const result = runner(rows, consoleProxy);
+  return {
+    output:
+      [...logs, result !== undefined ? `Return value: ${String(result)}` : ""].filter(Boolean).join("\n") ||
+      "JavaScript finished.",
+  };
+}
+
+function explainError(language: CodeLanguage, message: string) {
+  const lower = message.toLowerCase();
+  if (lower.includes("syntax")) {
+    return `${language.toUpperCase()} syntax issue detected. Recheck commas, brackets, quotes, and function names.`;
+  }
+  if (lower.includes("nameerror") || lower.includes("not defined")) {
+    return "A variable or function is missing. Define it first or verify the spelling.";
+  }
+  if (lower.includes("column") || lower.includes("no such") || lower.includes("table")) {
+    return "Sakha could not find the field or table you referenced. Check the uploaded dataset headers and use current_data for the active table.";
+  }
+  return "Read the error top to bottom, isolate the failing line, and rerun after the smallest possible fix.";
+}
+
+function explainNextSteps(language: CodeLanguage, code: string, output: string) {
+  const suggestions: string[] = [];
+  if (language === "python") {
+    suggestions.push("Use df.head(), df.info(), and df.describe() early to understand the dataset.");
+    if (!/plot|matplotlib|plt\./i.test(code)) {
+      suggestions.push("If you want a chart, try plt.plot(...), plt.bar(...), or df.plot(...).");
+    }
+  }
+  if (language === "sql") {
+    suggestions.push("Start with SELECT * FROM current_data LIMIT 10 before joins or aggregations.");
+    if (!/group by/i.test(code)) {
+      suggestions.push("Try GROUP BY and aggregate functions next if you are exploring trends.");
+    }
+  }
+  if (language === "dax") {
+    suggestions.push("Start with SUM, AVERAGE, COUNTROWS, DISTINCTCOUNT, MAX, and MIN before trying CALCULATE filters.");
+  }
+  if (language === "javascript") {
+    suggestions.push("Use array methods like map, filter, reduce, and sort for quick data practice.");
+  }
+  if (/error|traceback|failed/i.test(output)) {
+    suggestions.push(explainError(language, output));
+  }
+  return suggestions.join("\n");
+}
+
+function evaluateDaxFormula(code: string, dataset?: DataTable) {
+  const formula = code.trim();
+  if (!dataset) {
+    return {
+      value: "No dataset",
+      explanation: "Upload a CSV or Excel file so Sakha can evaluate common DAX measures against your current data.",
+    };
+  }
+
+  const expression = formula.includes("=") ? formula.split("=").slice(1).join("=").trim() : formula;
+  const rows = dataset.rows;
+
+  const sumMatch = expression.match(/^SUM\(([^[]+)\[([^\]]+)\]\)$/i);
+  const avgMatch = expression.match(/^AVERAGE\(([^[]+)\[([^\]]+)\]\)$/i);
+  const countRowsMatch = expression.match(/^COUNTROWS\(([^)]+)\)$/i);
+  const distinctMatch = expression.match(/^DISTINCTCOUNT\(([^[]+)\[([^\]]+)\]\)$/i);
+  const minMatch = expression.match(/^MIN\(([^[]+)\[([^\]]+)\]\)$/i);
+  const maxMatch = expression.match(/^MAX\(([^[]+)\[([^\]]+)\]\)$/i);
+  const calculateMatch = expression.match(
+    /^CALCULATE\(SUM\(([^[]+)\[([^\]]+)\]\),\s*([^[]+)\[([^\]]+)\]\s*=\s*"([^"]+)"\s*\)$/i,
+  );
+
+  if (sumMatch) {
+    const total = sumColumn(rows, sumMatch[2]);
+    return { value: String(total), explanation: `SUM over column ${sumMatch[2]} on ${rows.length} row(s).` };
+  }
+  if (avgMatch) {
+    const values = numberColumn(rows, avgMatch[2]);
+    const avg = values.length ? values.reduce((a, b) => a + b, 0) / values.length : 0;
+    return { value: String(avg), explanation: `AVERAGE over column ${avgMatch[2]} using ${values.length} numeric row(s).` };
+  }
+  if (countRowsMatch) {
+    return { value: String(rows.length), explanation: `COUNTROWS on current dataset returned ${rows.length}.` };
+  }
+  if (distinctMatch) {
+    const distinct = new Set(rows.map((row) => String(row[distinctMatch[2]] ?? ""))).size;
+    return { value: String(distinct), explanation: `DISTINCTCOUNT over column ${distinctMatch[2]}.` };
+  }
+  if (minMatch) {
+    const values = numberColumn(rows, minMatch[2]);
+    return { value: String(Math.min(...values)), explanation: `MIN over column ${minMatch[2]}.` };
+  }
+  if (maxMatch) {
+    const values = numberColumn(rows, maxMatch[2]);
+    return { value: String(Math.max(...values)), explanation: `MAX over column ${maxMatch[2]}.` };
+  }
+  if (calculateMatch) {
+    const filtered = rows.filter((row) => String(row[calculateMatch[4]] ?? "") === calculateMatch[5]);
+    const total = sumColumn(filtered, calculateMatch[2]);
+    return {
+      value: String(total),
+      explanation: `CALCULATE with a simple equality filter on ${calculateMatch[4]} = ${calculateMatch[5]}. ${filtered.length} row(s) matched.`,
+    };
+  }
+
+  return {
+    value: "Unsupported",
+    explanation:
+      'This DAX practice mode currently evaluates SUM, AVERAGE, COUNTROWS, DISTINCTCOUNT, MIN, MAX, and simple CALCULATE(SUM(...), Column = "value") patterns.',
+  };
+}
+
+function numberColumn(rows: Record<string, unknown>[], column: string) {
+  return rows
+    .map((row) => Number(row[column]))
+    .filter((value) => Number.isFinite(value));
+}
+
+function sumColumn(rows: Record<string, unknown>[], column: string) {
+  return numberColumn(rows, column).reduce((a, b) => a + b, 0);
 }

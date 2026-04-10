@@ -10,9 +10,11 @@
   },
   "dependencies": {
     "alasql": "^4.17.2",
+    "chart.js": "^4.5.1",
     "next": "16.2.3",
     "papaparse": "^5.5.3",
     "react": "19.2.4",
+    "react-chartjs-2": "^5.3.1",
     "react-dom": "19.2.4",
     "xlsx": "^0.18.5"
   },
