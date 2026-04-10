@@ -16,7 +16,7 @@ import {
 import { Bar, Line } from "react-chartjs-2";
 import { useEffect, useMemo, useRef, useState } from "react";
 
-import { AppState } from "@/lib/types";
+import { AppState, ProviderId } from "@/lib/types";
 
 ChartJS.register(CategoryScale, LinearScale, PointElement, LineElement, BarElement, Tooltip, Legend);
 
@@ -28,6 +28,7 @@ type WorkspaceTab = "chat" | "practice";
 type CodeLanguage = "javascript" | "python" | "sql" | "dax";
 type ChartKind = "bar" | "line";
 type RuntimeMode = "browser" | "laptop";
+type ConnectionProvider = Exclude<ProviderId, "ollama">;
 
 type ChatTurn = {
   id: string;
@@ -90,6 +91,11 @@ const challengePrompts = [
   "Act like a data analyst interviewer and ask me a pandas problem.",
   "Give me a DAX practice task and explain the correct measure after I answer.",
 ];
+const providerOptions: Array<{ id: ConnectionProvider; label: string; modelPlaceholder: string }> = [
+  { id: "openai", label: "OpenAI", modelPlaceholder: "gpt-4.1-mini or another API model" },
+  { id: "openrouter", label: "OpenRouter", modelPlaceholder: "openai/gpt-4.1-mini or a free model" },
+  { id: "huggingface", label: "Hugging Face", modelPlaceholder: "openai/gpt-oss-20b or your router model" },
+];
 
 export function ChatShell({ initialState }: Props) {
   const [state, setState] = useState(initialState);
@@ -99,6 +105,10 @@ export function ChatShell({ initialState }: Props) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [menuOpen, setMenuOpen] = useState(false);
+  const [connectOpen, setConnectOpen] = useState(false);
+  const [liveProvider, setLiveProvider] = useState<ConnectionProvider>("openrouter");
+  const [liveApiKey, setLiveApiKey] = useState("");
+  const [liveModel, setLiveModel] = useState("");
   const [pythonReady, setPythonReady] = useState(false);
   const [attachments, setAttachments] = useState<AttachmentItem[]>([]);
   const [activeDataset, setActiveDataset] = useState<string>("");
@@ -137,6 +147,7 @@ export function ChatShell({ initialState }: Props) {
   const categoricalHeaders = workingHeaders.filter((header) => !numericHeaders.includes(header));
   const recentTasks = state.tasks.slice(0, 4);
   const chartData = buildChartData(workingRows, chartX, chartY);
+  const liveConnectionReady = Boolean(liveApiKey.trim() && liveModel.trim());
   const datasetProfile = useMemo(() => {
     if (!selectedDataset) return null;
     const sample = selectedDataset.rows.slice(0, 100);
@@ -170,6 +181,13 @@ export function ChatShell({ initialState }: Props) {
       setActiveDataset(datasets[0].name);
     }
   }, [activeDataset, datasets]);
+
+  useEffect(() => {
+    const saved = window.localStorage.getItem("sakha-live-provider");
+    if (saved) setLiveProvider(saved as ConnectionProvider);
+    setLiveApiKey(window.localStorage.getItem("sakha-live-api-key") || "");
+    setLiveModel(window.localStorage.getItem("sakha-live-model") || "");
+  }, []);
 
   useEffect(() => {
     if (!window.alasql) return;
@@ -234,6 +252,7 @@ export function ChatShell({ initialState }: Props) {
 
     setLoading(true);
     setError("");
+    setPrompt("");
     setChatTurns((current) => [...current, { id: crypto.randomUUID(), role: "user", content: text }]);
 
     try {
@@ -241,7 +260,17 @@ export function ChatShell({ initialState }: Props) {
       const response = await fetch("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message, providerId: "auto" }),
+        body: JSON.stringify({
+          message,
+          providerId: "auto",
+          runtimeProvider: liveConnectionReady
+            ? {
+                id: liveProvider,
+                apiKey: liveApiKey.trim(),
+                model: liveModel.trim(),
+              }
+            : undefined,
+        }),
       });
 
       const data = (await response.json()) as {
@@ -259,9 +288,9 @@ export function ChatShell({ initialState }: Props) {
         { id: crypto.randomUUID(), role: "assistant", content: data.message || "" },
       ]);
       if (data.state) setState(data.state);
-      setPrompt("");
     } catch (caughtError) {
       setError(caughtError instanceof Error ? caughtError.message : "Unknown error");
+      setPrompt(text);
     } finally {
       setLoading(false);
       setMenuOpen(false);
@@ -401,15 +430,41 @@ export function ChatShell({ initialState }: Props) {
     setMenuOpen(false);
   }
 
+  function saveConnection() {
+    window.localStorage.setItem("sakha-live-provider", liveProvider);
+    window.localStorage.setItem("sakha-live-api-key", liveApiKey);
+    window.localStorage.setItem("sakha-live-model", liveModel);
+    setConnectOpen(false);
+  }
+
+  function clearConnection() {
+    window.localStorage.removeItem("sakha-live-provider");
+    window.localStorage.removeItem("sakha-live-api-key");
+    window.localStorage.removeItem("sakha-live-model");
+    setLiveApiKey("");
+    setLiveModel("");
+  }
+
   function generateSampleDataset() {
-    const rows = [
-      { Region: "North", Product: "Laptop", Sales: 1240, Profit: 250, Month: "Jan" },
-      { Region: "South", Product: "Phone", Sales: 920, Profit: 140, Month: "Jan" },
-      { Region: "East", Product: "Tablet", Sales: 690, Profit: 120, Month: "Feb" },
-      { Region: "West", Product: "Laptop", Sales: 1430, Profit: 280, Month: "Feb" },
-      { Region: "North", Product: "Phone", Sales: 880, Profit: 135, Month: "Mar" },
-      { Region: "East", Product: "Laptop", Sales: 1510, Profit: 310, Month: "Mar" },
-    ];
+    const regions = ["North", "South", "East", "West"];
+    const products = ["Laptop", "Phone", "Tablet", "Monitor", "Keyboard"];
+    const months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun"];
+    const channels = ["Online", "Retail", "Partner"];
+    const rows = Array.from({ length: 48 }, (_, index) => {
+      const sales = 500 + Math.floor(Math.random() * 1800);
+      const cost = Math.floor(sales * (0.55 + Math.random() * 0.2));
+      return {
+        OrderID: `ORD-${Date.now().toString().slice(-5)}-${index + 1}`,
+        Region: regions[Math.floor(Math.random() * regions.length)],
+        Product: products[Math.floor(Math.random() * products.length)],
+        Month: months[Math.floor(Math.random() * months.length)],
+        Channel: channels[Math.floor(Math.random() * channels.length)],
+        Units: 5 + Math.floor(Math.random() * 45),
+        Sales: sales,
+        Cost: cost,
+        Profit: sales - cost,
+      };
+    });
 
     const table: DataTable = {
       name: `sample_sales_${attachments.filter((item) => item.table).length + 1}`,
@@ -506,26 +561,53 @@ export function ChatShell({ initialState }: Props) {
             <div className="text-[11px] uppercase tracking-[0.28em] text-slate-500">Sakha</div>
             <h1 className="mt-2 text-2xl font-semibold text-white">Personal AI workspace</h1>
           </div>
-          <div className="flex items-center gap-2 rounded-full bg-white/5 p-1">
-            {([
-              ["chat", "Chat"],
-              ["practice", "Practice"],
-            ] as const).map(([value, label]) => (
-              <button
-                key={value}
-                onClick={() => setTab(value)}
-                className={`rounded-full px-4 py-2 text-sm transition ${tab === value ? "bg-lime-300 text-slate-950" : "text-slate-300 hover:bg-white/8"}`}
-              >
-                {label}
-              </button>
-            ))}
+          <div className="flex flex-wrap items-center gap-3">
+            <div className="flex items-center gap-2 rounded-full bg-white/5 p-1">
+              {([
+                ["chat", "Chat"],
+                ["practice", "Practice"],
+              ] as const).map(([value, label]) => (
+                <button
+                  key={value}
+                  onClick={() => setTab(value)}
+                  className={`rounded-full px-4 py-2 text-sm transition ${tab === value ? "bg-lime-300 text-slate-950" : "text-slate-300 hover:bg-white/8"}`}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+            <button onClick={() => setConnectOpen((current) => !current)} className="rounded-full bg-white/6 px-4 py-2 text-sm text-slate-100 hover:bg-white/10">
+              {liveConnectionReady ? "AI connected" : "Connect AI"}
+            </button>
           </div>
         </header>
+
+        {connectOpen ? (
+          <div className="border-b border-white/8 bg-black/20 px-4 py-4 md:px-6">
+            <div className="grid gap-3 lg:grid-cols-[180px_minmax(0,1fr)_minmax(0,1fr)_auto]">
+              <select value={liveProvider} onChange={(event) => setLiveProvider(event.target.value as ConnectionProvider)} className="rounded-[14px] border border-white/8 bg-black/25 px-3 py-3 text-sm text-white outline-none">
+                {providerOptions.map((option) => <option key={option.id} value={option.id}>{option.label}</option>)}
+              </select>
+              <input value={liveApiKey} onChange={(event) => setLiveApiKey(event.target.value)} type="password" placeholder="Paste API key" className="rounded-[14px] border border-white/8 bg-black/25 px-3 py-3 text-sm text-white outline-none placeholder:text-slate-500" />
+              <input value={liveModel} onChange={(event) => setLiveModel(event.target.value)} placeholder={providerOptions.find((option) => option.id === liveProvider)?.modelPlaceholder} className="rounded-[14px] border border-white/8 bg-black/25 px-3 py-3 text-sm text-white outline-none placeholder:text-slate-500" />
+              <div className="flex gap-2">
+                <button onClick={saveConnection} className="rounded-full bg-lime-300 px-4 py-2 text-sm font-medium text-slate-950 hover:bg-lime-200">Save</button>
+                <button onClick={clearConnection} className="rounded-full bg-white/6 px-4 py-2 text-sm text-slate-100 hover:bg-white/10">Clear</button>
+              </div>
+            </div>
+            <p className="mt-3 text-sm text-slate-400">Use your own API key here. ChatGPT subscription alone does not provide API access, but OpenAI API, OpenRouter, or Hugging Face keys will work.</p>
+          </div>
+        ) : null}
 
         {tab === "chat" ? (
           <div className="grid flex-1 lg:grid-cols-[minmax(0,1fr)_320px]">
             <section className="flex min-h-0 flex-col">
               <div className="flex-1 overflow-auto px-4 py-4 md:px-6">
+                {!liveConnectionReady ? (
+                  <div className="mb-4 rounded-[18px] border border-amber-400/20 bg-amber-400/10 p-4 text-sm text-amber-100">
+                    Chat is not connected to a live AI model yet. Use `Connect AI` above, save your API key and model, then Sakha will answer live instead of falling back.
+                  </div>
+                ) : null}
                 {chatTurns.length ? (
                   <div className="space-y-4">
                     {chatTurns.map((turn) => (
@@ -632,6 +714,11 @@ export function ChatShell({ initialState }: Props) {
                 <button onClick={() => practiceUploadRef.current?.click()} className="rounded-full bg-lime-300 px-4 py-2 text-sm font-medium text-slate-950 hover:bg-lime-200">Upload data</button>
                 <button onClick={generateSampleDataset} className="rounded-full bg-white/6 px-4 py-2 text-sm text-slate-100 hover:bg-white/10">Generate sample data</button>
               </div>
+              <p className="mt-3 text-sm text-slate-400">
+                {datasets.length
+                  ? `${datasets.length} dataset(s) loaded. Upload multiple files to practice joins and comparisons.`
+                  : "Upload CSV, Excel, or JSON datasets. After upload, Sakha will show fields and let you query them."}
+              </p>
 
               <div className="mt-4 space-y-2">
                 {datasets.length ? datasets.map((dataset) => (

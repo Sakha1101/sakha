@@ -1,23 +1,34 @@
 import { createChatCompletion } from "@/lib/openai-compatible";
-import { getProviderKey, getProviders, pickProvider } from "@/lib/providers";
+import { getProviderById, getProviderKey, getProviders, pickProvider } from "@/lib/providers";
 import { appendMemory, getAppState, upsertTask } from "@/lib/storage";
 import { buildSystemPrompt } from "@/lib/system-prompt";
 import { executeTool, toolSpecs } from "@/lib/tools";
-import { AgentTask, ChatMessage, ProviderChoice } from "@/lib/types";
+import { AgentTask, ChatMessage, ProviderChoice, ProviderId } from "@/lib/types";
 
 export async function runAgent({
   providerId,
   message,
+  runtimeProvider,
 }: {
   providerId: ProviderChoice;
   message: string;
+  runtimeProvider?: {
+    id: ProviderId;
+    apiKey?: string;
+    model?: string;
+  };
 }) {
   const state = await getAppState();
-  const resolvedProvider =
-    providerId === "auto"
+  const resolvedProvider = runtimeProvider?.id
+    ? {
+        ...getProviderById(runtimeProvider.id),
+        defaultModel: runtimeProvider.model || getProviderById(runtimeProvider.id).defaultModel,
+        status: runtimeProvider.apiKey ? "configured" : getProviderById(runtimeProvider.id).status,
+      }
+    : providerId === "auto"
       ? pickProvider(message, state.providers)
       : getProviders().find((provider) => provider.id === providerId) ?? state.providers[0];
-  const apiKey = getProviderKey(resolvedProvider);
+  const apiKey = runtimeProvider?.apiKey || getProviderKey(resolvedProvider);
 
   if (resolvedProvider.status === "missing") {
     const fallback = buildOfflineReply(message);
