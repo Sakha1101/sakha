@@ -1,11 +1,14 @@
 import { promises as fs } from "fs";
+import os from "os";
 import path from "path";
 
 import { MODULES } from "@/lib/modules";
 import { getProviders } from "@/lib/providers";
 import { AppState, MemoryItem, AgentTask } from "@/lib/types";
 
-const dataDir = path.join(process.cwd(), "data");
+const dataDir = process.env.VERCEL
+  ? path.join(os.tmpdir(), "sakha")
+  : path.join(process.cwd(), "data");
 const stateFile = path.join(dataDir, "sakha-state.json");
 const driveFileName = process.env.GOOGLE_DRIVE_FILE_NAME || "sakha-state.json";
 const storageMode = process.env.STORAGE_BACKEND === "google-drive" ? "google-drive" : "local";
