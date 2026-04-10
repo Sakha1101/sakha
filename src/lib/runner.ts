@@ -19,10 +19,27 @@ export async function runAgent({
       : getProviders().find((provider) => provider.id === providerId) ?? state.providers[0];
   const apiKey = getProviderKey(resolvedProvider);
 
-  if (resolvedProvider.status === "missing" && resolvedProvider.id !== "ollama") {
-    throw new Error(
-      `Missing ${resolvedProvider.apiKeyEnv}. Add it to your environment before using ${resolvedProvider.label}.`,
-    );
+  if (resolvedProvider.status === "missing") {
+    const fallback = buildOfflineReply(message);
+    const task: AgentTask = {
+      id: crypto.randomUUID(),
+      title: message.slice(0, 48),
+      instruction: message,
+      status: "done",
+      provider: "huggingface",
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      lastResult: fallback,
+    };
+
+    await upsertTask(task);
+
+    return {
+      message: fallback,
+      task,
+      resolvedProvider: "Offline mode",
+      state: await getAppState(),
+    };
   }
 
   const systemPrompt = buildSystemPrompt(resolvedProvider, state.memory);
@@ -105,4 +122,17 @@ function safeParse(raw: string) {
   } catch {
     return {};
   }
+}
+
+function buildOfflineReply(message: string) {
+  return [
+    "Sakha is running in offline mode right now, so live model execution is unavailable.",
+    "",
+    `Your request: ${message}`,
+    "",
+    "Best next step:",
+    "- If this is a coding task, open the Code tab and run code locally on your laptop.",
+    "- If this is a planning or writing task, add one provider key in deployment settings and Sakha will handle it from the chat workspace.",
+    "- If you want local machine actions, run Sakha on your laptop instead of the hosted site.",
+  ].join("\n");
 }

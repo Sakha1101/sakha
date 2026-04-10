@@ -1,7 +1,7 @@
 self.addEventListener("install", (event) => {
   event.waitUntil(
     caches.open("sakha-v2").then((cache) =>
-      cache.addAll(["/manifest.webmanifest", "/icon-192.svg", "/icon-512.svg"]),
+      cache.addAll(["/manifest.webmanifest", "/icon-192.png", "/icon-512.png"]),
     ),
   );
 });

@@ -38,7 +38,14 @@ const providerTemplates: Record<ProviderId, Omit<ProviderConfig, "status">> = {
 export function getProviders(): ProviderConfig[] {
   return Object.values(providerTemplates).map((provider) => ({
     ...provider,
-    status: provider.id === "ollama" || process.env[provider.apiKeyEnv] ? "configured" : "missing",
+    status:
+      provider.id === "ollama"
+        ? isOllamaReachable(provider.baseUrl)
+          ? "configured"
+          : "missing"
+        : process.env[provider.apiKeyEnv]
+          ? "configured"
+          : "missing",
   }));
 }
 
@@ -52,7 +59,7 @@ export function getProviderKey(provider: ProviderConfig): string | undefined {
 
 export function pickProvider(message: string, providers: ProviderConfig[]): ProviderConfig {
   const configured = providers.filter((provider) => provider.status === "configured");
-  const available = configured.length ? configured : providers.filter((provider) => provider.id === "ollama");
+  const available = configured.length ? configured : providers.filter((provider) => provider.id !== "ollama");
   const text = message.toLowerCase();
 
   const wantsLocal = /(file|folder|desktop|laptop|command|terminal|codebase|local machine|install|setup)/.test(text);
@@ -80,4 +87,12 @@ export function pickProvider(message: string, providers: ProviderConfig[]): Prov
   }
 
   return available[0] ?? providers[0];
+}
+
+function isOllamaReachable(baseUrl: string) {
+  if (process.env.VERCEL && /127\.0\.0\.1|localhost/.test(baseUrl)) {
+    return false;
+  }
+
+  return true;
 }
